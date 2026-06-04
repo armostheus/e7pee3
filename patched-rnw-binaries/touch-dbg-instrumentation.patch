@@ -1,0 +1,186 @@
+--- c:/Users/shubham.chakraborty/Desktop/SalesforceCodebase/POS/Vardan/POS-experiments/TouchAppV84/node_modules/react-native-windows/Microsoft.ReactNative/Fabric/Composition/CompositionEventHandler.cpp	2026-06-02 17:30:26.524805100 +0530
++++ /tmp/rnw-source/vnext/Microsoft.ReactNative/Fabric/Composition/CompositionEventHandler.cpp	2026-06-04 11:26:51.923433300 +0530
+@@ -29,6 +29,13 @@
+ 
+ const PointerId MOUSE_POINTER_ID = 1;
+ 
++// Debug logging — capture with DebugView (run as admin, enable Capture Win32 + Capture Global Win32)
++#define TOUCH_DBG(fmt, ...) do { \
++  wchar_t _buf[512]; \
++  swprintf_s(_buf, L"[CEH] " fmt L"\n", __VA_ARGS__); \
++  OutputDebugStringW(_buf); \
++} while(0)
++
+ bool IsMousePointerEvent(const facebook::react::PointerEvent &pointerEvent) {
+   return pointerEvent.pointerId == MOUSE_POINTER_ID;
+ }
+@@ -224,6 +231,12 @@
+           }
+         });
+ 
++    // Issue #16047: when ScrollView calls VisualInteractionSource::TryRedirectForManipulation
++    // and the OS hands the pointer over to the InteractionTracker, WinAppSDK
++    // does not fire PointerCaptureLost on this source — but it does fire
++    // PointerRoutedAway. Treat it the same way as captureloss: cancel any
++    // active touch RN is tracking for this pointer so Pressables don't get
++    // stuck in their pressed state.
+     m_pointerRoutedAwayToken =
+         pointerSource.PointerRoutedAway([wkThis = weak_from_this()](
+                                             winrt::Microsoft::UI::Input::InputPointerSource const &,
+@@ -1106,6 +1119,7 @@
+ void CompositionEventHandler::onPointerCaptureLost(
+     const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
+     winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
++  TOUCH_DBG(L"onPointerCaptureLost pointerId=%u activeTouches=%zu", pointerPoint.PointerId(), m_activeTouches.size());
+   if (SurfaceId() == -1)
+     return;
+ 
+@@ -1134,26 +1148,30 @@
+     m_pointerCapturingComponentTag = -1;
+   }
+ 
+-  // Also cancel any active touch for the specific pointer that lost capture, even
+-  // when no JS-level CapturePointer was ever issued. This handles ScrollView (and
+-  // any other VisualInteractionSource) calling TryRedirectForManipulation: the OS
+-  // reassigns the pointer to the InteractionTracker, fires PointerCaptureLost, and
+-  // then stops delivering PointerMoved/PointerReleased to us. Without this cleanup
+-  // m_activeTouches keeps a zombie entry whose target is the originally-pressed
+-  // Pressable, leaving it visually pressed and causing later taps to be attributed
+-  // to that original target. If the entry was already cleared above (for a JS-level
+-  // capture) or by onPointerReleased running first, the find() is a no-op.
+-  // Dispatch cancel BEFORE erasing so the event has proper touches arrays.
+-  std::vector<PointerId> idsToErase;
+-  for (const auto &pair : m_activeTouches) {
+-    if (pair.second.eventEmitter) {
+-      DispatchSynthesizedTouchCancelForActiveTouch(pair.second, pointerPoint, keyModifiers);
+-    }
+-    idsToErase.push_back(pair.first);
+-  }
+-  for (auto id : idsToErase) {
+-    m_activeTouches.erase(id);
+-  }
++  // Defense-in-depth cleanup for the specific pointer that lost capture, even
++  // when no JS-level CapturePointer was ever issued. The ScrollView
++  // TryRedirectForManipulation path comes in via PointerRoutedAway, not
++  // PointerCaptureLost (see onPointerRoutedAway and issue #16047), so this
++  // path covers the remaining system-driven losses (focus change, another
++  // window stealing input, system back gesture, etc.).
++  CancelActiveTouchForPointerInternal(pointerPoint.PointerId(), pointerPoint, keyModifiers);
++}
++
++void CompositionEventHandler::onPointerRoutedAway(
++    const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
++    winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
++  TOUCH_DBG(L"onPointerRoutedAway pointerId=%u activeTouches=%zu", pointerPoint.PointerId(), m_activeTouches.size());
++  if (SurfaceId() == -1)
++    return;
++
++  // Issue #16047: WinAppSDK fires PointerRoutedAway when the OS hands the
++  // pointer to another InputPointerSource — most importantly for us, when
++  // ScrollView calls VisualInteractionSource::TryRedirectForManipulation and
++  // the InteractionTracker takes the gesture for scrolling. We never get
++  // PointerMoved / PointerReleased / PointerCaptureLost for that pointer
++  // afterwards, so without this cleanup m_activeTouches keeps a zombie entry
++  // and the originally-pressed Pressable stays stuck in its pressed state.
++  CancelActiveTouchForPointerInternal(pointerPoint.PointerId(), pointerPoint, keyModifiers);
+ }
+ 
+ bool CompositionEventHandler::CancelActiveTouchForPointerInternal(
+@@ -1161,48 +1179,21 @@
+     const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
+     winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
+   auto activeTouch = m_activeTouches.find(pointerId);
+-  if (activeTouch == m_activeTouches.end())
++  if (activeTouch == m_activeTouches.end()) {
+     return false;
++  }
+ 
+   ActiveTouch cancelledTouchCopy = std::move(activeTouch->second);
+   m_activeTouches.erase(activeTouch);
+ 
+-  if (!cancelledTouchCopy.eventEmitter)
++  if (!cancelledTouchCopy.eventEmitter) {
+     return false;
+-
+-  auto pointForDispatch = pointerPoint;
+-  if (!pointForDispatch) {
+-    pointForDispatch = cancelledTouchCopy.lastPointerPoint;
+   }
+-  if (!pointForDispatch)
+-    return false;
+ 
+-  DispatchSynthesizedTouchCancelForActiveTouch(cancelledTouchCopy, pointForDispatch, keyModifiers);
++  DispatchSynthesizedTouchCancelForActiveTouch(cancelledTouchCopy, pointerPoint, keyModifiers);
+   return true;
+ }
+ 
+-void CompositionEventHandler::onPointerRoutedAway(
+-    const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
+-    winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
+-  if (SurfaceId() == -1)
+-    return;
+-
+-  // Dispatch cancel for each active touch BEFORE erasing, so the synthesized
+-  // event can still see m_activeTouches to build proper touches/targetTouches
+-  // arrays. The responder system needs those to process the cancel correctly.
+-  std::vector<PointerId> idsToErase;
+-  for (const auto &pair : m_activeTouches) {
+-    if (pair.second.eventEmitter) {
+-      auto pp = pair.second.lastPointerPoint ? pair.second.lastPointerPoint : pointerPoint;
+-      DispatchSynthesizedTouchCancelForActiveTouch(pair.second, pp, keyModifiers);
+-    }
+-    idsToErase.push_back(pair.first);
+-  }
+-  for (auto id : idsToErase) {
+-    m_activeTouches.erase(id);
+-  }
+-}
+-
+ void CompositionEventHandler::onPointerMoved(
+     const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
+     winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
+@@ -1258,7 +1249,6 @@
+     if (isActiveTouch) {
+       // For active touches with responders, also dispatch through touch event system
+       UpdateActiveTouch(activeTouch->second, ptScaled, ptLocal);
+-      activeTouch->second.lastPointerPoint = pointerPoint;
+       DispatchTouchEvent(TouchEventType::Move, pointerId, pointerPoint, keyModifiers);
+     }
+   }
+@@ -1350,6 +1340,11 @@
+     winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
+   namespace Composition = winrt::Microsoft::ReactNative::Composition;
+ 
++  TOUCH_DBG(L"onPointerPressed pointerId=%u type=%d activeTouches=%zu",
++      pointerPoint.PointerId(),
++      static_cast<int>(pointerPoint.PointerDeviceType()),
++      m_activeTouches.size());
++
+   auto *rootView = RootComponentView();
+   if (!rootView)
+     return;
+@@ -1469,7 +1464,6 @@
+       activeTouch.shouldLeaveWhenReleased = true;
+     }
+ 
+-    activeTouch.lastPointerPoint = pointerPoint;
+     m_activeTouches.emplace(pointerId, activeTouch);
+ 
+     DispatchTouchEvent(eventType, pointerId, pointerPoint, keyModifiers);
+@@ -1480,6 +1474,7 @@
+     const winrt::Microsoft::ReactNative::Composition::Input::PointerPoint &pointerPoint,
+     winrt::Windows::System::VirtualKeyModifiers keyModifiers) noexcept {
+   int pointerId = pointerPoint.PointerId();
++  TOUCH_DBG(L"onPointerReleased pointerId=%d activeTouches=%zu", pointerId, m_activeTouches.size());
+ 
+   auto *rootView = RootComponentView();
+   if (!rootView)
+@@ -1515,7 +1510,7 @@
+ 
+     UpdateActiveTouch(activeTouch->second, ptScaled, ptLocal);
+     DispatchTouchEvent(TouchEventType::End, pointerId, pointerPoint, keyModifiers);
+-    m_activeTouches.clear();
++    m_activeTouches.erase(pointerId);
+   }
+ }
+ 
